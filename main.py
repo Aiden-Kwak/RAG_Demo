@@ -8,8 +8,9 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core import VectorStoreIndex
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.readers import SimpleDirectoryReader
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm  # 진행도 표시
 
-# 환경 변수 로드
 load_dotenv()
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
 deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
@@ -56,8 +57,17 @@ def createRetriever(REPORT, CHUNK_SIZE, CHUNK_OVERLAP, TOP_K):
     parser = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     nodes = parser.get_nodes_from_documents(documents)
 
-    for node in nodes:
+    def process_node(node):
         node.embedding = create_embedding(node.text)
+        return node
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(process_node, node): node for node in nodes}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Embedding Progress"):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"Error processing node: {e}")
 
     index = VectorStoreIndex(nodes)
     retriever = VectorIndexRetriever(index=index, similarity_top_k=TOP_K)
