@@ -1,12 +1,12 @@
 import os
 import json
 import requests
+import numpy as np
+import faiss
 from dotenv import load_dotenv
 from openai import OpenAI
 from openai import AuthenticationError, APIConnectionError, RateLimitError, OpenAIError
 from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core import VectorStoreIndex
-from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.readers import SimpleDirectoryReader
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -15,7 +15,6 @@ load_dotenv()
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
 deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 openai_api_key = os.getenv("OPENAI_API_KEY")
-
 
 def load_claims(claim_file):
     try:
@@ -28,7 +27,6 @@ def load_claims(claim_file):
         print(f"Error: Failed to parse JSON in '{claim_file}'.")
         exit(1)
 
-
 def load_document_metadata(info_file):
     try:
         with open(info_file, "r") as f:
@@ -40,7 +38,6 @@ def load_document_metadata(info_file):
         print(f"Error: Failed to parse JSON in '{info_file}'.")
         exit(1)
 
-
 def create_embedding(text):
     try:
         client = OpenAI(api_key=openai_api_key)
@@ -49,71 +46,93 @@ def create_embedding(text):
             input=text
         )
         embedding = response.data[0].embedding
-        return embedding
+        return np.array(embedding, dtype=np.float32)
     except (AuthenticationError, APIConnectionError, RateLimitError, OpenAIError) as e:
         print(f"OpenAI API Error: {e}")
         exit(1)
 
+def save_faiss_index(index, metadata, index_file="faiss_index.bin", metadata_file="metadata.json"):
+    faiss.write_index(index, index_file)
+    with open(metadata_file, "w") as f:
+        json.dump(metadata, f)
+    print(f"Faiss index saved to {index_file}, metadata saved to {metadata_file}.")
 
-def createRetriever(REPORT, CHUNK_SIZE, CHUNK_OVERLAP, TOP_K, info_file):
+def load_faiss_index(index_file="faiss_index.bin", metadata_file="metadata.json"):
+    if not os.path.exists(index_file) or not os.path.exists(metadata_file):
+        print("Faiss index or metadata file not found. Generating new index.")
+        return None, None
+    index = faiss.read_index(index_file)
+    with open(metadata_file, "r") as f:
+        metadata = json.load(f)
+    print(f"Faiss index loaded from {index_file}, metadata loaded from {metadata_file}.")
+    return index, metadata
+
+def createRetriever(REPORT, CHUNK_SIZE, CHUNK_OVERLAP, info_file, index_file="faiss_index.bin", metadata_file="metadata.json", force_update=False):
+    if not force_update:
+        index, metadata = load_faiss_index(index_file, metadata_file)
+        if index and metadata:
+            return index, metadata
+
     documents = SimpleDirectoryReader(input_files=[REPORT]).load_data()
     parser = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     nodes = parser.get_nodes_from_documents(documents)
 
     document_metadata = load_document_metadata(info_file)
-    document_id = os.path.basename(REPORT).split(".")[0]  # 아이디랑 문서명이랑 통일했음
+    document_id = os.path.basename(REPORT).split(".")[0]
 
-    for node in nodes:
+    embeddings = []
+    metadata = []
+
+    def process_node(node):
         if document_id in document_metadata:
-            node.metadata = {
+            node_metadata = {
                 "document_name": document_metadata[document_id]["title"],
                 "report_type": document_metadata[document_id]["report_type"],
                 "release_year": document_metadata[document_id]["release_year"],
                 "full_report": document_metadata[document_id]["full_report"],
-                "page_label": node.metadata.get("label", "Unknown")
+                "page_label": node.metadata.get("label", "Unknown"),
+                "text": node.text
             }
         else:
-            node.metadata = {
+            node_metadata = {
                 "document_name": "Unknown Document",
                 "report_type": "Unknown",
                 "release_year": "Unknown",
                 "full_report": "Unknown",
-                "page_label": node.metadata.get("label", "Unknown") 
+                "page_label": node.metadata.get("label", "Unknown"),
+                "text": node.text
             }
 
-    def process_node(node):
-        node.embedding = create_embedding(node.text)
-        return node
+        embedding = create_embedding(node.text)
+        return embedding, node_metadata
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(process_node, node): node for node in nodes}
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Embedding Progress"):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing Nodes"):
             try:
-                future.result()
+                embedding, node_metadata = future.result()
+                embeddings.append(embedding)
+                metadata.append(node_metadata)
             except Exception as e:
                 print(f"Error processing node: {e}")
 
-    index = VectorStoreIndex(nodes)
-    retriever = VectorIndexRetriever(index=index, similarity_top_k=TOP_K)
-    return retriever
+    embeddings = np.array(embeddings)
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
 
+    save_faiss_index(index, metadata, index_file, metadata_file)
 
-def retrieve_evidence(retriever, claim_text):
-    relevant_nodes = retriever.retrieve(str_or_query_bundle=claim_text)
+    return index, metadata
+
+def retrieve_evidence(index, metadata, claim_text, top_k=5):
+    query_embedding = create_embedding(claim_text).reshape(1, -1)
+    distances, indices = index.search(query_embedding, top_k)
+
     evidence_list = []
-
-    for node in relevant_nodes:
-        evidence_list.append({
-            "document_name": node.metadata.get("document_name"),
-            "report_type": node.metadata.get("report_type"),
-            "release_year": node.metadata.get("release_year"),
-            "full_report": node.metadata.get("full_report"),
-            "page_number": node.metadata.get("page_label"),
-            "text": node.text
-        })
+    for i in indices[0]:
+        evidence_list.append(metadata[i])
 
     return evidence_list
-
 
 def build_prompt(context, claim, supplement, evidence_list):
     evidence_strings = []
@@ -121,7 +140,7 @@ def build_prompt(context, claim, supplement, evidence_list):
         evidence_strings.append(
             f"- Document: {evidence['document_name']} ({evidence['report_type']}, {evidence['release_year']})\n"
             f"  Full Report: {evidence['full_report']}\n"
-            f"  Page: {evidence['page_number']}.\n"
+            f"  Page: {evidence['page_label']}\n"
             f"  Text: {evidence['text']}\n"
         )
 
@@ -149,7 +168,6 @@ You are a fact-checking agent. Your task is to determine the accuracy of the giv
 ### Additional Supplementary Information
 "{supplement}"
 """
-
 
 def demo_agent(context, claim, supplement, evidence_list):
     prompt = build_prompt(context, claim, supplement, evidence_list)
@@ -182,7 +200,6 @@ def demo_agent(context, claim, supplement, evidence_list):
         print(f"Response Error: {e}")
         exit(1)
 
-
 def main():
     import sys
 
@@ -208,20 +225,19 @@ def main():
     claim_text = claim_data["claim"]
     supplement = claim_data.get("supplement", "No supplementary information provided.")
 
-    retriever = createRetriever(
+    index, metadata = createRetriever(
         REPORT=pdf_file,
         CHUNK_SIZE=512,
         CHUNK_OVERLAP=50,
-        TOP_K=5,
-        info_file=info_file
+        info_file=info_file,
+        force_update=False
     )
-    evidence_list = retrieve_evidence(retriever, claim_text)
+    evidence_list = retrieve_evidence(index, metadata, claim_text, top_k=5)
     context = "\n".join(evidence["text"] for evidence in evidence_list)
 
     result = demo_agent(context, claim_text, supplement, evidence_list)
     print(f"Claim: {claim_text}\n")
     print(f"Fact-check Result: {result}")
-
 
 if __name__ == "__main__":
     main()
