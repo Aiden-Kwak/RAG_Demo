@@ -10,11 +10,26 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.readers import SimpleDirectoryReader
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+from functools import lru_cache
 
 load_dotenv()
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
 deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 openai_api_key = os.getenv("OPENAI_API_KEY")
+
+from PyPDF2 import PdfReader
+
+def extract_text_with_page_numbers(pdf_path):
+    reader = PdfReader(pdf_path)
+    nodes = []
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text()
+        nodes.append({
+            "page_number": i + 1,  # Page numbers start from 1
+            "text": text.strip()
+        })
+    return nodes
+
 
 def load_claims(claim_file):
     try:
@@ -67,62 +82,89 @@ def load_faiss_index(index_file="faiss_index.bin", metadata_file="metadata.json"
     print(f"Faiss index loaded from {index_file}, metadata loaded from {metadata_file}.")
     return index, metadata
 
+@lru_cache(maxsize=10000)
+def create_embedding_with_cache(text):
+    try:
+        client = OpenAI(api_key=openai_api_key)
+        response = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text
+        )
+        embedding = response.data[0].embedding
+        return np.array(embedding, dtype=np.float32)
+    except (AuthenticationError, APIConnectionError, RateLimitError, OpenAIError) as e:
+        print(f"OpenAI API Error: {e}")
+        raise e
+
+def process_node(node, document_metadata, document_id):
+    embedding = create_embedding_with_cache(node["text"])
+    node_metadata = {
+        "page_label": node["page_label"],
+        "text": node["text"],
+        **document_metadata.get(document_id, {
+            "document_name": "Unknown Document",
+            "report_type": "Unknown",
+            "release_year": "Unknown",
+            "full_report": "Unknown"
+        })
+    }
+    return embedding, node_metadata
+
 def createRetriever(REPORT, CHUNK_SIZE, CHUNK_OVERLAP, info_file, index_file="faiss_index.bin", metadata_file="metadata.json", force_update=False):
     if not force_update:
         index, metadata = load_faiss_index(index_file, metadata_file)
         if index and metadata:
             return index, metadata
 
-    documents = SimpleDirectoryReader(input_files=[REPORT]).load_data()
-    parser = SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    nodes = parser.get_nodes_from_documents(documents)
+    # PDF 텍스트와 페이지 번호 추출
+    pdf_nodes = extract_text_with_page_numbers(REPORT)
 
+    # 텍스트를 CHUNK_SIZE로 분할
+    nodes = []
+    for node in pdf_nodes:
+        text = node["text"]
+        page_number = node["page_number"]
+        for i in range(0, len(text), CHUNK_SIZE - CHUNK_OVERLAP):
+            chunk_text = text[i:i + CHUNK_SIZE]
+            nodes.append({
+                "page_label": page_number,
+                "text": chunk_text
+            })
+
+    # 문서 메타데이터 로드
     document_metadata = load_document_metadata(info_file)
     document_id = os.path.basename(REPORT).split(".")[0]
 
     embeddings = []
     metadata = []
 
-    def process_node(node):
-        if document_id in document_metadata:
-            node_metadata = {
-                "document_name": document_metadata[document_id]["title"],
-                "report_type": document_metadata[document_id]["report_type"],
-                "release_year": document_metadata[document_id]["release_year"],
-                "full_report": document_metadata[document_id]["full_report"],
-                "page_label": node.metadata.get("label", "Unknown"),
-                "text": node.text
-            }
-        else:
-            node_metadata = {
-                "document_name": "Unknown Document",
-                "report_type": "Unknown",
-                "release_year": "Unknown",
-                "full_report": "Unknown",
-                "page_label": node.metadata.get("label", "Unknown"),
-                "text": node.text
-            }
-
-        embedding = create_embedding(node.text)
-        return embedding, node_metadata
-
+    # 병렬 작업으로 노드 처리
     with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(process_node, node): node for node in nodes}
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing Nodes"):
-            try:
-                embedding, node_metadata = future.result()
-                embeddings.append(embedding)
-                metadata.append(node_metadata)
-            except Exception as e:
-                print(f"Error processing node: {e}")
+        futures = {
+            executor.submit(process_node, node, document_metadata, document_id): node
+            for node in nodes
+        }
+        with tqdm(total=len(futures), desc="Processing Nodes") as pbar:
+            for future in as_completed(futures):
+                try:
+                    embedding, node_metadata = future.result()
+                    embeddings.append(embedding)
+                    metadata.append(node_metadata)
+                except Exception as e:
+                    print(f"Error processing node: {e}")
+                finally:
+                    pbar.update(1)
 
-    embeddings = np.array(embeddings)
+    # FAISS 인덱스 생성
+    embeddings = np.array(embeddings, dtype=np.float32)
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
 
+    # 인덱스와 메타데이터 저장
     save_faiss_index(index, metadata, index_file, metadata_file)
 
     return index, metadata
+
 
 def retrieve_evidence(index, metadata, claim_text, top_k=5):
     query_embedding = create_embedding(claim_text).reshape(1, -1)
@@ -135,38 +177,58 @@ def retrieve_evidence(index, metadata, claim_text, top_k=5):
     return evidence_list
 
 def build_prompt(context, claim, supplement, evidence_list):
+    """
+    Constructs a fact-checking prompt with a clear structure, logical reasoning, and reliable evidence citations,
+    explicitly providing source titles and page details for each evidence.
+
+    Parameters:
+        context (str): Background information related to the claim.
+        claim (str): The specific claim to be fact-checked.
+        supplement (str): Additional context or supplementary information to aid the fact-check.
+        evidence_list (list of dict): A list of evidence dictionaries, each containing title, report type, release year,
+                                      full report link, page label, and a relevant excerpt of text.
+
+    Returns:
+        str: A formatted prompt for a fact-checking task.
+    """
+    # Prepare formatted evidence strings
     evidence_strings = []
     for evidence in evidence_list:
         evidence_strings.append(
-            f"- Document: {evidence['document_name']} ({evidence['report_type']}, {evidence['release_year']})\n"
-            f"  Full Report: {evidence['full_report']}\n"
-            f"  Page: {evidence['page_label']}\n"
-            f"  Text: {evidence['text']}\n"
+            f"- **Source Title:** {evidence['title']}\n"
+            f"  **Report Type:** {evidence['report_type']} ({evidence['release_year']})\n"
+            f"  **Page:** {evidence['page_label']}\n"
+            f"  **Full Report Link:** {evidence['full_report']}\n"
+            f"  **Excerpt:** {evidence['text']}\n"
         )
-
     evidence_section = "\n".join(evidence_strings)
-    return f"""
-You are a fact-checking agent. Your task is to determine the accuracy of the given claim and provide appropriate reasoning and sources.
 
-### Role
-1. Your role is to verify facts based on objective and reliable information.
-2. When presenting evidence, you must include clear and accurate citations.
-3. Always adhere to the response format below.
+    # Build the fact-checking prompt
+    return f"""
+You are an expert fact-checking agent tasked with evaluating the accuracy of claims using reliable, objective, and scientific evidence.
+
+### Your Role
+1. Evaluate the accuracy of the claim based on provided evidence and context.
+2. Present your findings clearly and logically, ensuring your reasoning is accessible to both experts and the general audience.
+3. Support your reasoning with verifiable and properly cited sources, explicitly referencing the source titles and page details.
 
 ### Response Format
-- This claim is (inaccurate/accurate/incorrect/misleading/not enough evidence).
-- Because .....
-- This can be verified by **(Document Name)** on **(Page).page**, where it states: **(Original Text)**.
-- Additional Evidence:\n{evidence_section}
+- **Claim Evaluation:** This claim is (accurate/inaccurate/misleading/incorrect/not enough evidence).
+- **Reasoning:** A concise explanation of why the claim is or is not valid, backed by scientific evidence.
+- **Evidence:** Provide direct citations from trusted sources, explicitly naming the source title and page details, to validate your reasoning.
+- **Conclusion:** Summarize your findings in a way that is understandable to both technical and non-technical readers.
 
-### Given Claim
+### Claim to Evaluate
 "{claim}"
 
-### Provided Context
+### Contextual Information
 "{context}"
 
 ### Additional Supplementary Information
 "{supplement}"
+
+### Evidence
+{evidence_section}
 """
 
 def demo_agent(context, claim, supplement, evidence_list):
